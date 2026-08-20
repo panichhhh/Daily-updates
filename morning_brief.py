@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Daily investment brief -> LINE Official Account broadcast."""
+"""Daily investment brief (English) -> LINE Official Account broadcast."""
 
 import os
 import re
 import sys
 import html
+import time
 import datetime
 import zoneinfo
 import urllib.parse
@@ -28,13 +29,12 @@ EQUITIES = [
     ("S&P 500", "^GSPC", "{:,.2f}"),
     ("Nasdaq", "^IXIC", "{:,.2f}"),
     ("Dow", "^DJI", "{:,.2f}"),
-    ("SET (Thailand)", "^SET.BK", "{:,.2f}"),
 ]
 COMMODITIES_FX = [
     ("Gold", "GC=F", "${:,.0f}"),
     ("WTI Oil", "CL=F", "${:,.2f}"),
+    ("Brent", "BZ=F", "${:,.2f}"),
     ("Dollar (DXY)", "DX-Y.NYB", "{:,.2f}"),
-    ("USD/THB", "THB=X", "{:,.3f}"),
     ("BTC", "BTC-USD", "${:,.0f}"),
     ("ETH", "ETH-USD", "${:,.0f}"),
 ]
@@ -44,31 +44,44 @@ RATES = [
     ("US 10Y", "^TNX"),
     ("US 30Y", "^TYX"),
 ]
+THAI_MARKET = [
+    ("SET Index", "^SET.BK", "{:,.2f}"),
+    ("USD/THB", "THB=X", "{:,.3f}"),
+]
 
 SOURCE_FEEDS = [
+    "https://www.investing.com/rss/news_25.rss",
+    "https://www.investing.com/rss/news_1.rss",
+    "https://www.investing.com/rss/news_11.rss",
+    "https://www.investing.com/rss/news_14.rss",
     "https://feeds.marketwatch.com/marketwatch/topstories/",
-    "https://feeds.marketwatch.com/marketwatch/marketpulse/",
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
     "https://www.cnbc.com/id/20910258/device/rss/rss.html",
     "https://finance.yahoo.com/news/rssindex",
-    "https://www.investing.com/rss/news_25.rss",
 ]
 SUPPLEMENT_SEARCHES = [
-    "US Treasury buyback OR quarterly refunding OR debt management",
-    "Federal Reserve OR Treasury yields OR interest rates",
+    "central bank OR Federal Reserve OR ECB OR BOJ OR interest rate decision",
+    "inflation OR CPI OR jobs report OR GDP",
+    "oil prices OR OPEC OR Brent crude OR gold",
+    "US Treasury yields OR bond market OR buyback OR refunding",
+    "geopolitics OR tariffs OR China economy OR currency",
     "artificial intelligence OR Nvidia OR semiconductor stocks",
-    "inflation OR jobs report OR GDP OR economy",
-    "stock market OR S&P 500 OR earnings",
+]
+THAI_SEARCHES = [
+    "SET Index OR Thailand stock market OR Thai stocks",
+    "Bank of Thailand OR Thai baht OR Thailand economy OR SET50",
 ]
 KEYWORDS = [
-    ("treasury", 3), ("buyback", 3), ("refunding", 3), ("debt", 2),
-    ("fed", 3), ("federal reserve", 3), ("yield", 3), ("rate cut", 3),
-    ("rates", 2), ("inflation", 3), ("cpi", 3), ("ppi", 2), ("jobs", 2),
-    ("payroll", 2), ("gdp", 2), ("tariff", 2), ("bond", 2),
-    ("nvidia", 3), ("ai", 3), ("artificial intelligence", 3),
-    ("semiconductor", 3), ("chip", 2), ("earnings", 1), ("s&p", 1),
-    ("nasdaq", 1), ("dollar", 1), ("oil", 1), ("gold", 1),
+    ("central bank", 3), ("federal reserve", 3), ("fed", 3), ("ecb", 3),
+    ("boj", 3), ("boe", 2), ("rate cut", 3), ("rate hike", 3), ("rates", 2),
+    ("interest rate", 3), ("inflation", 3), ("cpi", 3), ("ppi", 2),
+    ("jobs", 2), ("payroll", 2), ("gdp", 2), ("treasury", 3), ("yield", 3),
+    ("bond", 2), ("buyback", 3), ("refunding", 3), ("debt", 2),
+    ("oil", 2), ("opec", 3), ("brent", 2), ("crude", 2), ("gold", 2),
+    ("tariff", 2), ("geopolit", 2), ("china", 2), ("currency", 2),
+    ("dollar", 2), ("yen", 1), ("euro", 1), ("nvidia", 2),
+    ("artificial intelligence", 2), (" ai ", 2), ("semiconductor", 2),
+    ("earnings", 1), ("s&p", 1), ("nasdaq", 1),
 ]
 
 
@@ -136,23 +149,29 @@ def clean_desc(raw, title):
         return ""
     if title and txt[:50].lower() == title[:50].lower():
         return ""
-    if len(txt) > 260:
-        txt = txt[:260].rsplit(" ", 1)[0] + "…"
+    if len(txt) > 300:
+        txt = txt[:300].rsplit(" ", 1)[0] + "…"
     return txt
 
 
-def fetch_entries(url):
+def fetch_entries(url, max_age_hours=24):
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     parsed = feedparser.parse(resp.content)
     feed_title = ""
     if getattr(parsed, "feed", None):
         feed_title = parsed.feed.get("title", "") or ""
+    now = time.time()
     items = []
     for e in parsed.entries:
         title = (e.get("title") or "").strip()
         if not title:
             continue
+        tp = e.get("published_parsed") or e.get("updated_parsed")
+        if tp is not None:
+            age_h = (now - time.mktime(tp)) / 3600.0
+            if age_h > max_age_hours:
+                continue
         src = ""
         s = e.get("source")
         if s and getattr(s, "get", None):
@@ -169,11 +188,15 @@ def fetch_entries(url):
     return items
 
 
-def gnews_url(query):
+def gnews_url(query, region="US"):
+    if region == "TH":
+        tail = "&hl=en-TH&gl=TH&ceid=TH:en"
+    else:
+        tail = "&hl=en-US&gl=US&ceid=US:en"
     return (
         "https://news.google.com/rss/search?q="
-        + urllib.parse.quote(query + " when:2d")
-        + "&hl=en-US&gl=US&ceid=US:en"
+        + urllib.parse.quote(query + " when:1d")
+        + tail
     )
 
 
@@ -199,32 +222,58 @@ def collect_news():
             print(f"news: failed feed {url}: {e}", file=sys.stderr)
     for q in SUPPLEMENT_SEARCHES:
         try:
-            add(fetch_entries(gnews_url(q)), cap=5)
+            add(fetch_entries(gnews_url(q)), cap=6)
         except Exception as e:
             print(f"news: failed search '{q}': {e}", file=sys.stderr)
     return items
 
 
-def score_item(it):
+def collect_thai_news(cap_total=5):
+    seen, items = set(), []
+    for q in THAI_SEARCHES:
+        try:
+            for it in fetch_entries(gnews_url(q, region="TH"))[:5]:
+                key = it["title"].lower()[:60]
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(it)
+        except Exception as e:
+            print(f"news: failed thai '{q}': {e}", file=sys.stderr)
+    return items[:cap_total]
+
+
+def is_macro(it):
     t = (it["title"] + " " + it.get("summary", "")).lower()
+    macro = ("central bank", "federal reserve", "fed", "ecb", "boj", "rate",
+             "inflation", "cpi", "gdp", "treasury", "yield", "bond", "oil",
+             "opec", "brent", "gold", "tariff", "geopolit", "china",
+             "currency", "dollar", "yen", "euro")
+    return any(k in t for k in macro)
+
+
+def score_item(it):
+    t = (" " + it["title"] + " " + it.get("summary", "") + " ").lower()
     return sum(w for kw, w in KEYWORDS if kw in t)
 
 
 def rank_news(items, n=8):
     ranked = sorted(items, key=score_item, reverse=True)
-    top = [it for it in ranked if score_item(it) > 0][:n]
-    if len(top) < n:
-        for it in ranked:
-            if it not in top:
-                top.append(it)
-            if len(top) >= n:
-                break
-    return top
+    macro = [it for it in ranked if is_macro(it)]
+    need_macro = max(n // 2, 1)
+    out = macro[:need_macro]
+    for it in ranked:
+        if it in out:
+            continue
+        out.append(it)
+        if len(out) >= n:
+            break
+    return out[:n]
 
 
 def news_text(items):
     if not items:
-        return "(news unavailable)"
+        return "(none found in last 24h)"
     out = []
     for it in items:
         line = "• " + it["title"]
@@ -236,25 +285,29 @@ def news_text(items):
     return "\n".join(out)
 
 
-def build_data(equities, commod, rates, items):
+def build_data(equities, commod, rates, world, thai_mkt, thai_news):
     blocks = [
         "EQUITIES:\n" + (equities or "(unavailable)"),
         "US TREASURY YIELDS:\n" + (rates or "(unavailable)"),
         "COMMODITIES / FX / CRYPTO:\n" + (commod or "(unavailable)"),
-        "NEWS ITEMS (title, source, summary) - ranked most relevant first:\n"
-        + news_text(items),
+        "WORLD NEWS (last 24h, ranked, macro first):\n" + news_text(world),
+        "THAI MARKET DATA:\n" + (thai_mkt or "(unavailable)"),
+        "THAI STOCK NEWS (last 24h):\n" + news_text(thai_news),
     ]
     return "\n\n".join(blocks)
 
 
 def write_brief_with_claude(data, date_str):
-    prompt = f"""You are a markets strategist writing a concise daily INVESTMENT brief. It is sent as a LINE text message, so use plain text only - no markdown, no asterisks, no '#'. Simple emoji and line breaks are fine. Target 1800-2600 characters.
+    prompt = f"""You are a financial content writer who summarizes international financial news for general investors, with a deep understanding of markets, economics and investing. Write today's INVESTMENT brief in ENGLISH, using ONLY the data below (do not use old or remembered news; do not invent figures not present in the data).
+
+It is sent as a LINE text message: plain text only, no markdown, no asterisks, no '#'. Emoji and line breaks are fine. Keep it under 2800 characters.
 
 Sections:
 1) Opening line with an emoji and the date.
-2) "Markets" - list equities, then Treasury yields (with bp moves), then commodities/FX/crypto. Keep every number exactly as given.
-3) "News" - summarize the 6-8 most investment-relevant items below. Write each as a single tight sentence (two if a number matters), leading with what happened and the key figure. Prioritize the Fed/Treasury/rates, AI/semis, inflation/jobs data, and major market moves. Do NOT invent figures not present in the data; if a summary is missing, summarize from the headline only.
-4) One-line sign-off.
+2) "Markets" - equities, then US Treasury yields (with bp moves), then commodities/FX/crypto. Keep numbers exactly as given.
+3) "Global news" - summarize the 6-8 world items below, one to two tight sentences each, at least half macro/global (central banks, rates, inflation, oil, indices, geopolitics, FX). Lead with what happened and the key figure.
+4) "Thai market" - state the SET Index and USD/THB figures, then summarize the Thai-stock news items below (2-4 of them) in one to two sentences each.
+5) One-line sign-off.
 
 DATE: {date_str}
 
@@ -270,10 +323,10 @@ DATA:
         },
         json={
             "model": MODEL,
-            "max_tokens": 1800,
+            "max_tokens": 2000,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=90,
+        timeout=120,
     )
     if r.status_code != 200:
         raise RuntimeError(f"Claude API {r.status_code}: {r.text}")
@@ -286,12 +339,14 @@ DATA:
     return text
 
 
-def format_brief_plain(equities, commod, rates, items, date_str):
+def format_brief_plain(equities, commod, rates, world, thai_mkt, thai_news, date_str):
     lines = [f"📈 Investment Brief — {date_str}", ""]
     lines += ["📊 Equities", equities or "(unavailable)", ""]
     lines += ["🏦 US Treasury Yields", rates or "(unavailable)", ""]
     lines += ["🪙 Commodities / FX / Crypto", commod or "(unavailable)", ""]
-    lines += ["📰 Top investment news", news_text(items), ""]
+    lines += ["🌏 Global news (last 24h)", news_text(world), ""]
+    lines += ["🇹🇭 Thai market", thai_mkt or "(unavailable)", ""]
+    lines += ["🇹🇭 Thai stock news", news_text(thai_news), ""]
     lines += ["Have a sharp day in the markets."]
     return "\n".join(lines)
 
@@ -319,19 +374,24 @@ def main():
     equities = quote_block(EQUITIES)
     commod = quote_block(COMMODITIES_FX)
     rates = rates_block()
-    items = rank_news(collect_news())
+    thai_mkt = quote_block(THAI_MARKET)
+    world = rank_news(collect_news())
+    thai_news = collect_thai_news()
 
     brief = None
     if ANTHROPIC_API_KEY:
         try:
             brief = write_brief_with_claude(
-                build_data(equities, commod, rates, items), date_str
+                build_data(equities, commod, rates, world, thai_mkt, thai_news),
+                date_str,
             )
             print("Brief written by Claude.")
         except Exception as e:
             print(f"Claude unavailable, using self-formatted brief: {e}", file=sys.stderr)
     if not brief:
-        brief = format_brief_plain(equities, commod, rates, items, date_str)
+        brief = format_brief_plain(
+            equities, commod, rates, world, thai_mkt, thai_news, date_str
+        )
         print("Brief self-formatted (no Claude).")
 
     print("----- BRIEF -----")
