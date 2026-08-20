@@ -2,7 +2,9 @@
 """Daily investment brief -> LINE Official Account broadcast."""
 
 import os
+import re
 import sys
+import html
 import datetime
 import zoneinfo
 import urllib.parse
@@ -42,10 +44,14 @@ RATES = [
     ("US 10Y", "^TNX"),
     ("US 30Y", "^TYX"),
 ]
-NEWS_TOPICS = [
-    ("AI & Tech", "artificial intelligence OR Nvidia OR AI chip stocks"),
-    ("Fed & Treasuries", "Federal Reserve OR Treasury yields OR bond market"),
-    ("Markets & Macro", "stock market OR S&P 500 OR earnings OR economy"),
+
+DETAIL_FEEDS = [
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+]
+WATCH_SEARCHES = [
+    ("AI & Tech", "artificial intelligence OR Nvidia OR semiconductor stocks"),
+    ("Fed & Rates", "Federal Reserve OR Treasury yields OR bond market"),
 ]
 
 
@@ -102,55 +108,114 @@ def rates_block():
     return "\n".join(lines)
 
 
-def get_news(per=3):
+def clean_desc(raw, title):
+    if not raw:
+        return ""
+    txt = re.sub(r"<[^>]+>", " ", raw)
+    txt = html.unescape(txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    low = txt.lower()
+    if not txt or "view full coverage" in low or "continue reading" in low:
+        return ""
+    if title and txt[:50].lower() == title[:50].lower():
+        return ""
+    if len(txt) > 240:
+        txt = txt[:240].rsplit(" ", 1)[0] + "…"
+    return txt
+
+
+def fetch_entries(url):
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    parsed = feedparser.parse(resp.content)
+    items = []
+    for e in parsed.entries:
+        title = (e.get("title") or "").strip()
+        if not title:
+            continue
+        src = ""
+        s = e.get("source")
+        if s and getattr(s, "get", None):
+            src = s.get("title", "") or ""
+        summary = clean_desc(e.get("summary", ""), title)
+        items.append({"title": title, "summary": summary, "source": src})
+    return items
+
+
+def get_detail_news(n=5):
+    seen, items = set(), []
+    for url in DETAIL_FEEDS:
+        try:
+            for it in fetch_entries(url):
+                key = it["title"].lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(it)
+        except Exception as e:
+            print(f"news: failed detail {url}: {e}", file=sys.stderr)
+    return items[:n]
+
+
+def get_watch(per=3):
     out = {}
-    for label, q in NEWS_TOPICS:
+    for label, q in WATCH_SEARCHES:
         url = (
             "https://news.google.com/rss/search?q="
-            + urllib.parse.quote(q)
+            + urllib.parse.quote(q + " when:2d")
             + "&hl=en-US&gl=US&ceid=US:en"
         )
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            parsed = feedparser.parse(resp.content)
-            out[label] = [e.title for e in parsed.entries[:per]]
+            out[label] = fetch_entries(url)[:per]
         except Exception as e:
-            print(f"news: failed {label}: {e}", file=sys.stderr)
+            print(f"news: failed watch {label}: {e}", file=sys.stderr)
             out[label] = []
     return out
 
 
-def news_text(news):
+def _fmt_item(it, with_summary=True):
+    line = "- " + it["title"]
+    if it.get("source"):
+        line += f" ({it['source']})"
+    if with_summary and it.get("summary"):
+        line += "\n  " + it["summary"]
+    return line
+
+
+def news_text(detail, watch):
     parts = []
-    for label, titles in news.items():
-        if not titles:
+    if detail:
+        parts.append("Top market stories:")
+        parts += [_fmt_item(it) for it in detail]
+        parts.append("")
+    for label, items in watch.items():
+        if not items:
             continue
         parts.append(label + ":")
-        parts.extend(f"- {t}" for t in titles)
+        parts += [_fmt_item(it) for it in items]
         parts.append("")
     return "\n".join(parts).strip() or "(news unavailable)"
 
 
-def build_data(equities, commod, rates, news):
+def build_data(equities, commod, rates, detail, watch):
     blocks = [
         "EQUITIES:\n" + (equities or "(unavailable)"),
         "US TREASURY YIELDS:\n" + (rates or "(unavailable)"),
         "COMMODITIES / FX / CRYPTO:\n" + (commod or "(unavailable)"),
-        "NEWS BY THEME:\n" + news_text(news),
+        "NEWS (headline, source, and summary):\n" + news_text(detail, watch),
     ]
     return "\n\n".join(blocks)
 
 
 def write_brief_with_claude(data, date_str):
-    prompt = f"""You are writing a concise daily INVESTMENT brief for a markets-focused reader. It will be sent as a LINE text message. Keep it under 1800 characters. Plain text only - no markdown, no asterisks, no '#'. Simple emoji and line breaks are fine.
+    prompt = f"""You are a markets strategist writing a detailed but concise daily INVESTMENT brief. It is sent as a LINE text message, so use plain text only - no markdown, no asterisks, no '#'. Simple emoji and line breaks are fine. Target 2000-2800 characters.
 
-Structure:
-- Opening line with an emoji and the date.
-- 1-2 sentences on the overall market tone, referencing rates/AI where relevant.
-- "Markets" section: equities, then Treasury yields, then commodities/FX/crypto (keep the numbers exactly as given).
-- "What's driving it" section: 4-6 of the most investment-relevant headlines below, each rewritten to one tight line, favoring AI, Fed/Treasuries, and major market moves.
-- One-line sign-off.
+Write these sections:
+1) Opening line with an emoji and the date.
+2) "Market tone" - 2-3 sentences tying together equities, Treasury yields, the dollar and AI/tech, using the exact figures provided.
+3) "Markets" - list equities, then Treasury yields (with the bp moves), then commodities/FX/crypto. Keep every number exactly as given.
+4) "What's driving it" - take the 5-7 most investment-relevant news items below and write each as 2-3 sentences: what happened, the key figures mentioned, and why it matters for markets. Prioritize AI/semis, the Fed/Treasuries, and major index or macro moves. Do NOT invent numbers that are not in the data.
+5) One-line sign-off.
 
 DATE: {date_str}
 
@@ -166,28 +231,28 @@ DATA:
         },
         json={
             "model": MODEL,
-            "max_tokens": 1200,
+            "max_tokens": 1800,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=60,
+        timeout=90,
     )
     if r.status_code != 200:
         raise RuntimeError(f"Claude API {r.status_code}: {r.text}")
-    data = r.json()
+    body = r.json()
     text = "".join(
-        b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+        b.get("text", "") for b in body.get("content", []) if b.get("type") == "text"
     ).strip()
     if not text:
         raise RuntimeError("Claude returned empty text")
     return text
 
 
-def format_brief_plain(equities, commod, rates, news, date_str):
+def format_brief_plain(equities, commod, rates, detail, watch, date_str):
     lines = [f"📈 Investment Brief — {date_str}", ""]
     lines += ["📊 Equities", equities or "(unavailable)", ""]
     lines += ["🏦 US Treasury Yields", rates or "(unavailable)", ""]
     lines += ["🪙 Commodities / FX / Crypto", commod or "(unavailable)", ""]
-    lines += ["📰 What's driving it", news_text(news), ""]
+    lines += ["📰 What's driving it", news_text(detail, watch), ""]
     lines += ["Have a sharp day in the markets."]
     return "\n".join(lines)
 
@@ -215,19 +280,20 @@ def main():
     equities = quote_block(EQUITIES)
     commod = quote_block(COMMODITIES_FX)
     rates = rates_block()
-    news = get_news()
+    detail = get_detail_news()
+    watch = get_watch()
 
     brief = None
     if ANTHROPIC_API_KEY:
         try:
             brief = write_brief_with_claude(
-                build_data(equities, commod, rates, news), date_str
+                build_data(equities, commod, rates, detail, watch), date_str
             )
             print("Brief written by Claude.")
         except Exception as e:
             print(f"Claude unavailable, using self-formatted brief: {e}", file=sys.stderr)
     if not brief:
-        brief = format_brief_plain(equities, commod, rates, news, date_str)
+        brief = format_brief_plain(equities, commod, rates, detail, watch, date_str)
         print("Brief self-formatted (no Claude).")
 
     print("----- BRIEF -----")
