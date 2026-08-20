@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Daily morning brief -> LINE Official Account broadcast."""
+"""Daily investment brief -> LINE Official Account broadcast."""
 
 import os
 import sys
 import datetime
 import zoneinfo
+import urllib.parse
 
 import requests
 import feedparser
@@ -20,6 +21,32 @@ UA = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 HEADERS = {"User-Agent": UA}
+
+EQUITIES = [
+    ("S&P 500", "^GSPC", "{:,.2f}"),
+    ("Nasdaq", "^IXIC", "{:,.2f}"),
+    ("Dow", "^DJI", "{:,.2f}"),
+    ("SET (Thailand)", "^SET.BK", "{:,.2f}"),
+]
+COMMODITIES_FX = [
+    ("Gold", "GC=F", "${:,.0f}"),
+    ("WTI Oil", "CL=F", "${:,.2f}"),
+    ("Dollar (DXY)", "DX-Y.NYB", "{:,.2f}"),
+    ("USD/THB", "THB=X", "{:,.3f}"),
+    ("BTC", "BTC-USD", "${:,.0f}"),
+    ("ETH", "ETH-USD", "${:,.0f}"),
+]
+RATES = [
+    ("US 3M", "^IRX"),
+    ("US 5Y", "^FVX"),
+    ("US 10Y", "^TNX"),
+    ("US 30Y", "^TYX"),
+]
+NEWS_TOPICS = [
+    ("AI & Tech", "artificial intelligence OR Nvidia OR AI chip stocks"),
+    ("Fed & Treasuries", "Federal Reserve OR Treasury yields OR bond market"),
+    ("Markets & Macro", "stock market OR S&P 500 OR earnings OR economy"),
+]
 
 
 def die(msg):
@@ -43,18 +70,9 @@ def yahoo_quote(symbol):
     return price, prev
 
 
-def get_markets():
-    symbols = [
-        ("S&P 500", "^GSPC", "{:,.2f}"),
-        ("Nasdaq", "^IXIC", "{:,.2f}"),
-        ("Dow", "^DJI", "{:,.2f}"),
-        ("SET (Thailand)", "^SET.BK", "{:,.2f}"),
-        ("USD/THB", "THB=X", "{:,.3f}"),
-        ("BTC", "BTC-USD", "${:,.0f}"),
-        ("ETH", "ETH-USD", "${:,.0f}"),
-    ]
+def quote_block(rows):
     lines = []
-    for label, sym, fmt in symbols:
+    for label, sym, fmt in rows:
         try:
             price, prev = yahoo_quote(sym)
             if price is None or prev is None:
@@ -64,51 +82,80 @@ def get_markets():
             lines.append(f"{label}: {fmt.format(price)} {arrow}{abs(chg):.2f}%")
         except Exception as e:
             print(f"markets: failed {label}: {e}", file=sys.stderr)
-    return "\n".join(lines) if lines else "(markets data unavailable)"
+    return "\n".join(lines)
 
 
-def get_news(n=8):
-    feeds = [
-        "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en",
-        "https://news.google.com/rss?hl=en-TH&gl=TH&ceid=TH:en",
-    ]
-    headlines = []
-    for f in feeds:
+def rates_block():
+    lines = []
+    for label, sym in RATES:
         try:
-            resp = requests.get(f, headers=HEADERS, timeout=15)
+            price, prev = yahoo_quote(sym)
+            if price is None or prev is None:
+                continue
+            y = price / 10 if price > 20 else price
+            yp = prev / 10 if prev > 20 else prev
+            bp = (y - yp) * 100
+            arrow = "▲" if bp >= 0 else "▼"
+            lines.append(f"{label}: {y:.2f}% {arrow}{abs(bp):.0f}bp")
+        except Exception as e:
+            print(f"rates: failed {label}: {e}", file=sys.stderr)
+    return "\n".join(lines)
+
+
+def get_news(per=3):
+    out = {}
+    for label, q in NEWS_TOPICS:
+        url = (
+            "https://news.google.com/rss/search?q="
+            + urllib.parse.quote(q)
+            + "&hl=en-US&gl=US&ceid=US:en"
+        )
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             parsed = feedparser.parse(resp.content)
-            for entry in parsed.entries[:n]:
-                headlines.append(entry.title)
+            out[label] = [e.title for e in parsed.entries[:per]]
         except Exception as e:
-            print(f"news: failed {f}: {e}", file=sys.stderr)
-    seen, out = set(), []
-    for h in headlines:
-        if h not in seen:
-            seen.add(h)
-            out.append(h)
-        if len(out) >= n:
-            break
-    return "\n".join(f"- {h}" for h in out) if out else "(news unavailable)"
+            print(f"news: failed {label}: {e}", file=sys.stderr)
+            out[label] = []
+    return out
 
 
-def write_brief_with_claude(markets, news, date_str):
-    prompt = f"""You are writing a short daily morning brief that will be sent as a LINE text message. Keep it under 1500 characters. Plain text only - no markdown, no asterisks, no '#' headers. Simple emoji and line breaks are fine. Be crisp, warm, and useful.
+def news_text(news):
+    parts = []
+    for label, titles in news.items():
+        if not titles:
+            continue
+        parts.append(label + ":")
+        parts.extend(f"- {t}" for t in titles)
+        parts.append("")
+    return "\n".join(parts).strip() or "(news unavailable)"
 
-Structure it like this:
-- An opening line with a sun emoji and the date.
-- One sentence reading the market mood.
-- A "Markets" section listing the figures below (keep the numbers exactly as given).
-- A "Headlines" section with the 4-6 most important items below, each rewritten to one tight line.
-- A short one-line sign-off.
+
+def build_data(equities, commod, rates, news):
+    blocks = [
+        "EQUITIES:\n" + (equities or "(unavailable)"),
+        "US TREASURY YIELDS:\n" + (rates or "(unavailable)"),
+        "COMMODITIES / FX / CRYPTO:\n" + (commod or "(unavailable)"),
+        "NEWS BY THEME:\n" + news_text(news),
+    ]
+    return "\n\n".join(blocks)
+
+
+def write_brief_with_claude(data, date_str):
+    prompt = f"""You are writing a concise daily INVESTMENT brief for a markets-focused reader. It will be sent as a LINE text message. Keep it under 1800 characters. Plain text only - no markdown, no asterisks, no '#'. Simple emoji and line breaks are fine.
+
+Structure:
+- Opening line with an emoji and the date.
+- 1-2 sentences on the overall market tone, referencing rates/AI where relevant.
+- "Markets" section: equities, then Treasury yields, then commodities/FX/crypto (keep the numbers exactly as given).
+- "What's driving it" section: 4-6 of the most investment-relevant headlines below, each rewritten to one tight line, favoring AI, Fed/Treasuries, and major market moves.
+- One-line sign-off.
 
 DATE: {date_str}
 
-MARKET DATA:
-{markets}
-
-NEWS HEADLINES:
-{news}
+DATA:
+{data}
 """
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -119,7 +166,7 @@ NEWS HEADLINES:
         },
         json={
             "model": MODEL,
-            "max_tokens": 1024,
+            "max_tokens": 1200,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=60,
@@ -135,20 +182,14 @@ NEWS HEADLINES:
     return text
 
 
-def format_brief_plain(markets, news, date_str):
-    return "\n".join(
-        [
-            f"☀️ Morning Brief — {date_str}",
-            "",
-            "📊 Markets",
-            markets,
-            "",
-            "📰 Headlines",
-            news,
-            "",
-            "Have a great day!",
-        ]
-    )
+def format_brief_plain(equities, commod, rates, news, date_str):
+    lines = [f"📈 Investment Brief — {date_str}", ""]
+    lines += ["📊 Equities", equities or "(unavailable)", ""]
+    lines += ["🏦 US Treasury Yields", rates or "(unavailable)", ""]
+    lines += ["🪙 Commodities / FX / Crypto", commod or "(unavailable)", ""]
+    lines += ["📰 What's driving it", news_text(news), ""]
+    lines += ["Have a sharp day in the markets."]
+    return "\n".join(lines)
 
 
 def broadcast(text):
@@ -171,18 +212,22 @@ def main():
     now = datetime.datetime.now(zoneinfo.ZoneInfo(TZ))
     date_str = now.strftime("%A, %d %B %Y")
 
-    markets = get_markets()
+    equities = quote_block(EQUITIES)
+    commod = quote_block(COMMODITIES_FX)
+    rates = rates_block()
     news = get_news()
 
     brief = None
     if ANTHROPIC_API_KEY:
         try:
-            brief = write_brief_with_claude(markets, news, date_str)
+            brief = write_brief_with_claude(
+                build_data(equities, commod, rates, news), date_str
+            )
             print("Brief written by Claude.")
         except Exception as e:
             print(f"Claude unavailable, using self-formatted brief: {e}", file=sys.stderr)
     if not brief:
-        brief = format_brief_plain(markets, news, date_str)
+        brief = format_brief_plain(equities, commod, rates, news, date_str)
         print("Brief self-formatted (no Claude).")
 
     print("----- BRIEF -----")
