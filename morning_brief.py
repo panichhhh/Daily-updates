@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily investment brief (English, analytical) -> LINE Official Account."""
+"""Daily investment brief (English, comprehensive) -> LINE Official Account."""
 
 import os
 import re
@@ -32,11 +32,16 @@ EQUITIES = [
 ]
 COMMODITIES_FX = [
     ("Gold", "GC=F", "${:,.0f}"),
-    ("WTI Oil", "CL=F", "${:,.2f}"),
-    ("Brent", "BZ=F", "${:,.2f}"),
     ("Dollar (DXY)", "DX-Y.NYB", "{:,.2f}"),
     ("BTC", "BTC-USD", "${:,.0f}"),
     ("ETH", "ETH-USD", "${:,.0f}"),
+]
+ENERGY = [
+    ("Brent", "BZ=F", "${:,.2f}"),
+    ("WTI", "CL=F", "${:,.2f}"),
+    ("RBOB Gasoline", "RB=F", "${:,.3f}"),
+    ("Heating Oil/Diesel", "HO=F", "${:,.3f}"),
+    ("Nat Gas", "NG=F", "${:,.3f}"),
 ]
 RATES = [
     ("US 3M", "^IRX"),
@@ -67,13 +72,20 @@ SUPPLEMENT_SEARCHES = [
     "Federal Reserve OR interest rate outlook OR rate cut",
     "US inflation OR CPI OR PCE OR labor market OR jobs report",
     "US Treasury yields OR bond market OR 10-year yield",
-    "oil prices OR OPEC OR Brent crude OR gold price",
     "central bank OR ECB OR BOJ OR geopolitics OR tariffs OR China economy",
     "S&P 500 OR Nasdaq OR big tech OR Nvidia OR semiconductor stocks",
 ]
+ENERGY_SEARCHES = [
+    "oil price outlook OR crude oil forecast OR OPEC production",
+    "refining margin OR crack spread OR Singapore GRM OR refinery",
+    "petrochemical prices OR ethylene OR polyethylene OR paraxylene OR naphtha",
+]
 THAI_SEARCHES = [
     "SET Index OR Thailand stock market OR Thai stocks",
-    "Bank of Thailand OR Thai baht OR Thailand economy OR SET50",
+    "Bank of Thailand OR Thai baht OR SET50 OR Thailand economy",
+    "site:kaohoononline.com OR site:kaohoon.com",
+    "site:efinancethai.com",
+    "Stock Exchange of Thailand OR site:set.or.th",
 ]
 KEYWORDS = [
     ("central bank", 3), ("federal reserve", 3), ("fed", 3), ("ecb", 3),
@@ -100,12 +112,23 @@ if not LINE_TOKEN and not DRY_RUN:
 def yahoo_quote(symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     r = requests.get(
-        url, headers=HEADERS, params={"range": "5d", "interval": "1d"}, timeout=15
+        url, headers=HEADERS, params={"range": "1mo", "interval": "1d"}, timeout=15
     )
     r.raise_for_status()
-    meta = r.json()["chart"]["result"][0]["meta"]
+    result = r.json()["chart"]["result"][0]
+    meta = result.get("meta", {})
+    closes = []
+    try:
+        closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
+    except Exception:
+        pass
     price = meta.get("regularMarketPrice")
-    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    if price is None and closes:
+        price = closes[-1]
+    if closes and len(closes) >= 2:
+        prev = closes[-2] if price == closes[-1] else closes[-1]
+    else:
+        prev = meta.get("previousClose") or meta.get("chartPreviousClose")
     return price, prev
 
 
@@ -224,7 +247,7 @@ def gnews_url(query, region="US"):
     )
 
 
-def collect_news():
+def _collect(searches, region="US", per=5, feeds=None):
     seen, items = set(), []
 
     def add(entries, cap=None):
@@ -239,32 +262,29 @@ def collect_news():
             if cap and n >= cap:
                 break
 
-    for url in SOURCE_FEEDS:
+    for url in (feeds or []):
         try:
             add(fetch_entries(url))
         except Exception as e:
             print(f"news: failed feed {url}: {e}", file=sys.stderr)
-    for q in SUPPLEMENT_SEARCHES:
+    for q in searches:
         try:
-            add(fetch_entries(gnews_url(q)), cap=6)
+            add(fetch_entries(gnews_url(q, region=region)), cap=per)
         except Exception as e:
             print(f"news: failed search '{q}': {e}", file=sys.stderr)
     return items
 
 
-def collect_thai_news(cap_total=5):
-    seen, items = set(), []
-    for q in THAI_SEARCHES:
-        try:
-            for it in fetch_entries(gnews_url(q, region="TH"))[:5]:
-                key = it["title"].lower()[:60]
-                if key in seen:
-                    continue
-                seen.add(key)
-                items.append(it)
-        except Exception as e:
-            print(f"news: failed thai '{q}': {e}", file=sys.stderr)
-    return items[:cap_total]
+def collect_news():
+    return _collect(SUPPLEMENT_SEARCHES, per=6, feeds=SOURCE_FEEDS)
+
+
+def collect_energy_news(cap_total=6):
+    return _collect(ENERGY_SEARCHES, per=4)[:cap_total]
+
+
+def collect_thai_news(cap_total=7):
+    return _collect(THAI_SEARCHES, region="TH", per=4)[:cap_total]
 
 
 def is_macro(it):
@@ -309,33 +329,37 @@ def news_text(items):
     return "\n".join(out)
 
 
-def build_data(equities, commod, rates, movers, world, thai_mkt, thai_news):
+def build_data(equities, commod, energy, rates, movers, world, energy_news,
+               thai_mkt, thai_news):
     blocks = [
         "EQUITIES:\n" + (equities or "(unavailable)"),
         "US TREASURY YIELDS (level and daily bp change):\n" + (rates or "(unavailable)"),
         "COMMODITIES / FX / CRYPTO:\n" + (commod or "(unavailable)"),
+        "ENERGY COMPLEX (crude, products, gas):\n" + (energy or "(unavailable)"),
         "LARGE-CAP MOVERS (biggest % moves today):\n" + movers_text(movers),
         "WORLD NEWS (last 24h, ranked, macro first):\n" + news_text(world),
+        "ENERGY / REFINING / PETROCHEMICAL NEWS:\n" + news_text(energy_news),
         "THAI MARKET DATA:\n" + (thai_mkt or "(unavailable)"),
-        "THAI STOCK NEWS (last 24h):\n" + news_text(thai_news),
+        "THAI STOCK NEWS (Kaohoon / efinanceThai / SET / others):\n" + news_text(thai_news),
     ]
     return "\n\n".join(blocks)
 
 
 def write_brief_with_claude(data, date_str):
-    prompt = f"""You are a financial content writer summarizing international financial news for general investors, with deep understanding of markets, economics and investing. Write today's INVESTMENT brief in ENGLISH using ONLY the data below. Do not use old or remembered news, and do not invent any figure that is not in the data.
+    prompt = f"""You are a financial content writer summarizing international financial news for general investors, with deep understanding of markets, economics, energy/petrochemicals and investing. Write today's INVESTMENT brief in ENGLISH using ONLY the data below. Do not use old or remembered news, and do not invent any figure not present in the data. Any Thai-language headlines should be translated to English.
 
-It is a LINE text message: plain text only, no markdown, no asterisks, no '#'. Emoji and line breaks are fine. Keep it under 3800 characters. Write these sections in order:
+It is a LINE message: plain text only, no markdown, no asterisks, no '#'. Emoji and line breaks are fine. Be COMPREHENSIVE yet VERY CONCISE - short sentences, enough detail to be useful, no fluff. Aim for roughly 3500-4500 characters total. Write these sections in order:
 
-1) Opening line: an emoji + the date.
-2) "Market drivers" - 2-4 sentences on the key drivers behind current market movements, tying together the index moves, yields, the dollar, oil/gold and the main news.
-3) "Markets" - equities, then Treasury yields (with bp moves), then commodities/FX/crypto. Keep numbers exactly as given.
-4) "Stocks in focus" - the 5 large-cap movers listed below; for each give its move and one short reason (use the news if relevant, otherwise keep it factual).
-5) "Economic & Fed watch" - summarize the latest on the Federal Reserve, the US interest-rate outlook, inflation, the labor market, and US Treasury yields; cite key yield levels/changes from the data. Then, in 2-3 simple sentences, explain how these developments affect growth stocks, tech stocks, gold, and the US dollar.
-6) "Global news" - 3-5 other important macro/global items summarized in one tight sentence each.
-7) "Thai market" - the SET Index and USD/THB figures, then summarize the Thai-stock news (2-4 items).
-8) "Watch tonight" - a short list of what investors should keep an eye on tonight (events, data, levels).
-9) One-line sign-off.
+1) Opening: an emoji + the date.
+2) "Market drivers" - 2-3 sentences on what is moving markets, tying together indices, yields, the dollar, oil and the main news.
+3) "Markets" - equities, then Treasury yields (with bp), then commodities/FX/crypto. Keep numbers exactly as given.
+4) "Stocks in focus" - the 5 large-cap movers below; each: the move + one short reason.
+5) "Economic & Fed watch" - concise summary of the Fed, US rate outlook, inflation, labor market and Treasury yields, citing key levels/changes. Then 2-3 simple sentences on how this affects growth stocks, tech stocks, gold, and the US dollar.
+6) "Energy & petrochemicals" - crude oil price + outlook, refining margins / crack spreads, and petrochemical (e.g. ethylene, PX, PE) price trends, from the energy data and news. Note the read-through for Thai energy/refiner/petrochem names (e.g. PTT, PTTGC, TOP, SPRC, IRPC, IVL) where the news supports it.
+7) "Global news" - 3-4 other important macro/global items, one tight sentence each.
+8) "Thai market" - SET Index and USD/THB figures, then summarize the Thai-stock news (3-5 items) from Kaohoon/efinanceThai/SET/others.
+9) "Watch tonight" - short list of events/data/levels to watch tonight.
+10) One-line sign-off.
 
 DATE: {date_str}
 
@@ -351,10 +375,10 @@ DATA:
         },
         json={
             "model": MODEL,
-            "max_tokens": 2600,
+            "max_tokens": 3000,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=150,
+        timeout=180,
     )
     if r.status_code != 200:
         raise RuntimeError(f"Claude API {r.status_code}: {r.text}")
@@ -367,33 +391,59 @@ DATA:
     return text
 
 
-def format_brief_plain(equities, commod, rates, movers, world, thai_mkt, thai_news, date_str):
+def format_brief_plain(equities, commod, energy, rates, movers, world,
+                       energy_news, thai_mkt, thai_news, date_str):
     lines = [f"📈 Investment Brief — {date_str}", ""]
     lines += ["📊 Equities", equities or "(unavailable)", ""]
     lines += ["🏦 US Treasury Yields", rates or "(unavailable)", ""]
     lines += ["🪙 Commodities / FX / Crypto", commod or "(unavailable)", ""]
+    lines += ["⛽ Energy complex", energy or "(unavailable)", ""]
     lines += ["🔥 Large-cap movers", movers_text(movers), ""]
     lines += ["🌏 Global news (last 24h)", news_text(world), ""]
+    lines += ["🛢️ Energy / refining / petrochemical news", news_text(energy_news), ""]
     lines += ["🇹🇭 Thai market", thai_mkt or "(unavailable)", ""]
     lines += ["🇹🇭 Thai stock news", news_text(thai_news), ""]
     lines += ["(Enable the Claude API key for the written analysis sections.)"]
     return "\n".join(lines)
 
 
+def split_message(text, limit=4800, max_parts=5):
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ""
+    for para in text.split("\n\n"):
+        block = para + "\n\n"
+        if len(block) > limit:
+            for line in block.split("\n"):
+                if len(cur) + len(line) + 1 > limit and cur:
+                    parts.append(cur.rstrip())
+                    cur = ""
+                cur += line + "\n"
+            continue
+        if len(cur) + len(block) > limit and cur:
+            parts.append(cur.rstrip())
+            cur = ""
+        cur += block
+    if cur.strip():
+        parts.append(cur.rstrip())
+    return parts[:max_parts]
+
+
 def broadcast(text):
-    text = text[:4900]
+    parts = split_message(text)
+    messages = [{"type": "text", "text": p[:4900]} for p in parts]
     r = requests.post(
         "https://api.line.me/v2/bot/message/broadcast",
         headers={
             "Authorization": f"Bearer {LINE_TOKEN}",
             "Content-Type": "application/json",
         },
-        json={"messages": [{"type": "text", "text": text}]},
+        json={"messages": messages},
         timeout=30,
     )
     if r.status_code != 200:
         die(f"LINE API error {r.status_code}: {r.text}")
-    print("Broadcast sent OK")
+    print(f"Broadcast sent OK ({len(messages)} message(s))")
 
 
 def main():
@@ -402,17 +452,20 @@ def main():
 
     equities = quote_block(EQUITIES)
     commod = quote_block(COMMODITIES_FX)
+    energy = quote_block(ENERGY)
     rates = rates_block()
     thai_mkt = quote_block(THAI_MARKET)
     movers = get_movers()
     world = rank_news(collect_news())
+    energy_news = collect_energy_news()
     thai_news = collect_thai_news()
 
     brief = None
     if ANTHROPIC_API_KEY:
         try:
             brief = write_brief_with_claude(
-                build_data(equities, commod, rates, movers, world, thai_mkt, thai_news),
+                build_data(equities, commod, energy, rates, movers, world,
+                           energy_news, thai_mkt, thai_news),
                 date_str,
             )
             print("Brief written by Claude.")
@@ -420,7 +473,8 @@ def main():
             print(f"Claude unavailable, using self-formatted brief: {e}", file=sys.stderr)
     if not brief:
         brief = format_brief_plain(
-            equities, commod, rates, movers, world, thai_mkt, thai_news, date_str
+            equities, commod, energy, rates, movers, world, energy_news,
+            thai_mkt, thai_news, date_str
         )
         print("Brief self-formatted (no Claude).")
 
