@@ -29,10 +29,15 @@ EQUITIES = [
     ("S&P 500", "^GSPC", "{:,.2f}"),
     ("Nasdaq", "^IXIC", "{:,.2f}"),
     ("Dow", "^DJI", "{:,.2f}"),
+    ("Russell 2000", "^RUT", "{:,.2f}"),
+    ("VIX", "^VIX", "{:,.2f}"),
 ]
 COMMODITIES_FX = [
     ("Gold", "GC=F", "${:,.0f}"),
+    ("Silver", "SI=F", "${:,.2f}"),
     ("Dollar (DXY)", "DX-Y.NYB", "{:,.2f}"),
+    ("USD/JPY", "JPY=X", "{:,.2f}"),
+    ("EUR/USD", "EURUSD=X", "{:,.4f}"),
     ("BTC", "BTC-USD", "${:,.0f}"),
     ("ETH", "ETH-USD", "${:,.0f}"),
 ]
@@ -55,7 +60,7 @@ THAI_MARKET = [
 ]
 MOVERS_UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
-    "AVGO", "AMD", "JPM", "XOM", "LLY",
+    "AVGO", "AMD", "JPM", "XOM", "LLY", "NFLX", "CRM",
 ]
 
 SOURCE_FEEDS = [
@@ -80,10 +85,15 @@ ENERGY_SEARCHES = [
     "refining margin OR crack spread OR Singapore GRM OR refinery",
     "petrochemical prices OR ethylene OR polyethylene OR paraxylene OR naphtha",
 ]
+THAI_FEEDS = [
+    "https://www.kaohoon.com/feed",
+    "https://www.kaohoon.com/category/latest-news/feed",
+    "https://www.bangkokpost.com/rss/data/business.xml",
+    "https://www.prachachat.net/feed",
+]
 THAI_SEARCHES = [
     "SET Index OR Thailand stock market OR Thai stocks",
     "Bank of Thailand OR Thai baht OR SET50 OR Thailand economy",
-    "site:kaohoononline.com OR site:kaohoon.com",
     "site:efinancethai.com",
     "Stock Exchange of Thailand OR site:set.or.th",
 ]
@@ -122,13 +132,12 @@ def yahoo_quote(symbol):
         closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
     except Exception:
         pass
+    if len(closes) >= 2:
+        return closes[-1], closes[-2]
     price = meta.get("regularMarketPrice")
     if price is None and closes:
         price = closes[-1]
-    if closes and len(closes) >= 2:
-        prev = closes[-2] if price == closes[-1] else closes[-1]
-    else:
-        prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+    prev = meta.get("previousClose") or meta.get("chartPreviousClose")
     return price, prev
 
 
@@ -188,7 +197,7 @@ def movers_text(movers):
     return "\n".join(out)
 
 
-def clean_desc(raw, title):
+def clean_text(raw, title, max_len=300):
     if not raw:
         return ""
     txt = re.sub(r"<[^>]+>", " ", raw)
@@ -199,13 +208,13 @@ def clean_desc(raw, title):
         return ""
     if title and txt[:50].lower() == title[:50].lower():
         return ""
-    if len(txt) > 300:
-        txt = txt[:300].rsplit(" ", 1)[0] + "…"
+    if len(txt) > max_len:
+        txt = txt[:max_len].rsplit(" ", 1)[0] + "…"
     return txt
 
 
-def fetch_entries(url, max_age_hours=24):
-    resp = requests.get(url, headers=HEADERS, timeout=15)
+def fetch_entries(url, max_age_hours=24, max_chars=300, prefer_content=False):
+    resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     parsed = feedparser.parse(resp.content)
     feed_title = ""
@@ -222,6 +231,13 @@ def fetch_entries(url, max_age_hours=24):
             age_h = (now - time.mktime(tp)) / 3600.0
             if age_h > max_age_hours:
                 continue
+        raw = ""
+        if prefer_content:
+            c = e.get("content")
+            if c and isinstance(c, list) and c and c[0].get("value"):
+                raw = c[0]["value"]
+        if not raw:
+            raw = e.get("summary", "")
         src = ""
         s = e.get("source")
         if s and getattr(s, "get", None):
@@ -231,7 +247,7 @@ def fetch_entries(url, max_age_hours=24):
         items.append(
             {
                 "title": title,
-                "summary": clean_desc(e.get("summary", ""), title),
+                "summary": clean_text(raw, title, max_chars),
                 "source": src,
             }
         )
@@ -247,44 +263,58 @@ def gnews_url(query, region="US"):
     )
 
 
-def _collect(searches, region="US", per=5, feeds=None):
+def _add(seen, items, entries, cap=None):
+    n = 0
+    for it in entries:
+        key = it["title"].lower()[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(it)
+        n += 1
+        if cap and n >= cap:
+            break
+
+
+def collect_news():
     seen, items = set(), []
-
-    def add(entries, cap=None):
-        n = 0
-        for it in entries:
-            key = it["title"].lower()[:60]
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append(it)
-            n += 1
-            if cap and n >= cap:
-                break
-
-    for url in (feeds or []):
+    for url in SOURCE_FEEDS:
         try:
-            add(fetch_entries(url))
+            _add(seen, items, fetch_entries(url))
         except Exception as e:
             print(f"news: failed feed {url}: {e}", file=sys.stderr)
-    for q in searches:
+    for q in SUPPLEMENT_SEARCHES:
         try:
-            add(fetch_entries(gnews_url(q, region=region)), cap=per)
+            _add(seen, items, fetch_entries(gnews_url(q)), cap=6)
         except Exception as e:
             print(f"news: failed search '{q}': {e}", file=sys.stderr)
     return items
 
 
-def collect_news():
-    return _collect(SUPPLEMENT_SEARCHES, per=6, feeds=SOURCE_FEEDS)
-
-
 def collect_energy_news(cap_total=6):
-    return _collect(ENERGY_SEARCHES, per=4)[:cap_total]
+    seen, items = set(), []
+    for q in ENERGY_SEARCHES:
+        try:
+            _add(seen, items, fetch_entries(gnews_url(q)), cap=4)
+        except Exception as e:
+            print(f"news: failed energy '{q}': {e}", file=sys.stderr)
+    return items[:cap_total]
 
 
-def collect_thai_news(cap_total=7):
-    return _collect(THAI_SEARCHES, region="TH", per=4)[:cap_total]
+def collect_thai_news(cap_total=9):
+    seen, items = set(), []
+    for url in THAI_FEEDS:
+        try:
+            _add(seen, items, fetch_entries(url, max_chars=500, prefer_content=True),
+                 cap=4)
+        except Exception as e:
+            print(f"news: failed thai feed {url}: {e}", file=sys.stderr)
+    for q in THAI_SEARCHES:
+        try:
+            _add(seen, items, fetch_entries(gnews_url(q, region="TH")), cap=3)
+        except Exception as e:
+            print(f"news: failed thai search '{q}': {e}", file=sys.stderr)
+    return items[:cap_total]
 
 
 def is_macro(it):
@@ -301,7 +331,7 @@ def score_item(it):
     return sum(w for kw, w in KEYWORDS if kw in t)
 
 
-def rank_news(items, n=8):
+def rank_news(items, n=10):
     ranked = sorted(items, key=score_item, reverse=True)
     macro = [it for it in ranked if is_macro(it)]
     need_macro = max(n // 2, 1)
@@ -340,25 +370,28 @@ def build_data(equities, commod, energy, rates, movers, world, energy_news,
         "WORLD NEWS (last 24h, ranked, macro first):\n" + news_text(world),
         "ENERGY / REFINING / PETROCHEMICAL NEWS:\n" + news_text(energy_news),
         "THAI MARKET DATA:\n" + (thai_mkt or "(unavailable)"),
-        "THAI STOCK NEWS (Kaohoon / efinanceThai / SET / others):\n" + news_text(thai_news),
+        "THAI NEWS (Kaohoon / Bangkok Post / Prachachat / efinanceThai / SET):\n"
+        + news_text(thai_news),
     ]
     return "\n\n".join(blocks)
 
 
 def write_brief_with_claude(data, date_str):
-    prompt = f"""You are a financial content writer summarizing international financial news for general investors, with deep understanding of markets, economics, energy/petrochemicals and investing. Write today's INVESTMENT brief in ENGLISH using ONLY the data below. Do not use old or remembered news, and do not invent any figure not present in the data. Any Thai-language headlines should be translated to English.
+    prompt = f"""You are a senior markets strategist and financial content writer. Write today's INVESTMENT brief in ENGLISH for informed general investors, using ONLY the data below. Do not use old or remembered news, and do not invent any figure not present in the data. Translate any Thai-language content into clear English.
 
-It is a LINE message: plain text only, no markdown, no asterisks, no '#'. Emoji and line breaks are fine. Be COMPREHENSIVE yet VERY CONCISE - short sentences, enough detail to be useful, no fluff. Aim for roughly 3500-4500 characters total. Write these sections in order:
+Goal: COMPREHENSIVE and DETAILED enough that the reader gets the complete picture, but written efficiently - short paragraphs and crisp bullet lines, no padding. It is delivered over LINE and may span a few messages, so depth is fine (aim ~5000-7000 characters). Plain text only: no markdown, no asterisks, no '#'. Emoji as section markers and line breaks are fine.
 
-1) Opening: an emoji + the date.
-2) "Market drivers" - 2-3 sentences on what is moving markets, tying together indices, yields, the dollar, oil and the main news.
-3) "Markets" - equities, then Treasury yields (with bp), then commodities/FX/crypto. Keep numbers exactly as given.
-4) "Stocks in focus" - the 5 large-cap movers below; each: the move + one short reason.
-5) "Economic & Fed watch" - concise summary of the Fed, US rate outlook, inflation, labor market and Treasury yields, citing key levels/changes. Then 2-3 simple sentences on how this affects growth stocks, tech stocks, gold, and the US dollar.
-6) "Energy & petrochemicals" - crude oil price + outlook, refining margins / crack spreads, and petrochemical (e.g. ethylene, PX, PE) price trends, from the energy data and news. Note the read-through for Thai energy/refiner/petrochem names (e.g. PTT, PTTGC, TOP, SPRC, IRPC, IVL) where the news supports it.
-7) "Global news" - 3-4 other important macro/global items, one tight sentence each.
-8) "Thai market" - SET Index and USD/THB figures, then summarize the Thai-stock news (3-5 items) from Kaohoon/efinanceThai/SET/others.
-9) "Watch tonight" - short list of events/data/levels to watch tonight.
+Write these sections in order:
+
+1) Header: an emoji + the date, then a 2-3 sentence executive summary of the single most important takeaway from overnight trading.
+2) "Market drivers" - 3-5 sentences explaining WHAT moved markets and WHY, connecting equities, Treasury yields, the dollar, oil and the key news into one narrative.
+3) "Markets" - list equities, then Treasury yields (with bp moves), then commodities/FX/crypto. Keep every number exactly as given, and add a few words of context on the notable moves.
+4) "Stocks in focus" - the 5 large-cap movers below; for each: the move plus 1-2 sentences on the reason (from the news where possible) and what it signals.
+5) "Economic & Fed watch" - detailed but concise: the Fed stance, US rate-cut outlook, inflation, the labor market, and Treasury yields, citing the levels/changes. Then clearly explain how these affect growth stocks, tech stocks, gold, and the US dollar (2-4 sentences).
+6) "Energy & petrochemicals" - crude price and outlook, refining margins / crack spreads, and petrochemical (ethylene, PX, PE, naphtha) trends from the data/news, with the read-through for Thai energy/refiner/petrochem names (PTT, PTTEP, TOP, SPRC, IRPC, PTTGC, IVL) where supported.
+7) "Global & macro news" - 4-6 other important items, each 1-2 sentences with the key figures.
+8) "Thai market" - the SET Index and USD/THB figures with brief context, then summarize 4-6 of the Thai news items below (from Kaohoon, Bangkok Post, Prachachat, etc.) in 1-2 detailed sentences each, naming the stocks/sectors involved.
+9) "Watch today/tonight" - a concise bullet list of the key events, data releases, earnings and price levels investors should watch next.
 10) One-line sign-off.
 
 DATE: {date_str}
@@ -375,10 +408,10 @@ DATA:
         },
         json={
             "model": MODEL,
-            "max_tokens": 3000,
+            "max_tokens": 4000,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=180,
+        timeout=240,
     )
     if r.status_code != 200:
         raise RuntimeError(f"Claude API {r.status_code}: {r.text}")
@@ -402,7 +435,7 @@ def format_brief_plain(equities, commod, energy, rates, movers, world,
     lines += ["🌏 Global news (last 24h)", news_text(world), ""]
     lines += ["🛢️ Energy / refining / petrochemical news", news_text(energy_news), ""]
     lines += ["🇹🇭 Thai market", thai_mkt or "(unavailable)", ""]
-    lines += ["🇹🇭 Thai stock news", news_text(thai_news), ""]
+    lines += ["🇹🇭 Thai news", news_text(thai_news), ""]
     lines += ["(Enable the Claude API key for the written analysis sections.)"]
     return "\n".join(lines)
 
